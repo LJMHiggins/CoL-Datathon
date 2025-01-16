@@ -16,7 +16,7 @@ Just a place to share code, analysis and ideas.
 
 Some template folders (create any folder or add anything you think is missing):
 - `/CPTAC/`: A folder dedicated to datasets and analysis related to the Clinical Proteomic Tumor Analysis Consortium (CPTAC)
-- `TCGA/`: A folder dedicated to datasets and analysis related to the The Cancer Genome Atlas (TCGA).
+- `/TCGA/`: A folder dedicated to datasets and analysis related to the The Cancer Genome Atlas (TCGA).
 - `/scripts/`: (Placeholder) Code used for data cleaning, analysis, and visualization.
 - `/notebooks/`: (Placeholder) Jupyter notebooks showcasing exploratory data analysis (EDA) and key insights.
 - `/outputs/`: (Placeholder) Final reports, visualizations, or processed data.
