@@ -1,0 +1,496 @@
+---
+title: "Associations TME and drug response in TCGA"
+author: "Maria Roman Escorza - KCL"
+date: "`r Sys.Date()`"
+output: 
+  bookdown::html_document2:
+    code_folding: hide
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    fig_caption: true
+    fig_width: 7
+    fig_height: 6
+    number_sections: true
+    theme: lumen
+---
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(survival)
+library(survminer)
+library(data.table)
+library(dplyr)
+```
+
+This report looks for associations between the TME and therapy response in TCGA
+BRCA TNBC dataset.
+
+# Load data
+
+We load TNBC BRCA TCGA data.
+
+```{r}
+# Load metadata
+metadata <- data.table::fread("TCGA_TNBC_treatment.csv") %>%
+  filter(regimen_indication %in% c("ADJUVANT", "")) %>%  # Filter non-adjuvant
+  filter(therapy_types %in% c("Chemotherapy", "Immunotherapy")) %>%  # Keep chemo and immune therapy
+  mutate(
+    measure_of_response = factor(
+      measure_of_response,
+      levels = c("Complete Response", "Partial Response", "Clinical Progressive Disease", "")
+    )
+  )
+
+# Load FU data
+fu_data <- data.table::fread("TCGA_TNBC_fu_data.csv") %>%
+  mutate(
+    status = case_when(
+      person_neoplasm_cancer_status == "WITH TUMOR" ~ 1,
+      person_neoplasm_cancer_status == "TUMOR FREE" ~ 0,
+      TRUE ~ -1
+    ),
+    time = case_when(
+      status == 1 ~ days_to_new_tumor_event_after_initial_treatment,
+      status == 0 & vital_status == "Alive" ~ days_to_last_followup,
+      status == 0 & vital_status == "Dead" ~ days_to_death,
+      TRUE ~ NA_real_
+    ),
+    time = time / 30.44
+  )
+
+# Load cell composition data
+deconvoluted <- data.table::fread("TCGA_TNBC_tcga_deconvoluted.csv")
+
+# Load normalized RNA data
+gexp <- misomix::readGexp("TCGA_TNBC_RNAseq_TPMs.tsv")
+
+# Load the DESeq2 single cell results
+deseq_sc <- data.table::fread("DESeq2_differential_testing.csv")
+```
+
+# Response to treatment vs cell abundance
+
+Cell proportion per sample was downloaded and correlated with response to treatment for exploration.
+
+```{r}
+# Preparing the data, merge deconvoluted and metadata
+data <- merge(
+  deconvoluted,
+  metadata,
+  by.x = "TCGA Participant Barcode",
+  by.y = "bcr_patient_barcode"
+)
+
+# Stack the data for plotting
+data_long <- data.table::melt(
+  data,
+  measure.vars = colnames(deconvoluted)[c(5:8, 37:64)]
+)
+```
+
+```{r, fig.height=20, fig.width=20}
+# Boxplot cell abundance per treatment response
+ggplot(
+  data_long[data_long$measure_of_response != "", ],
+  aes(
+    x = measure_of_response, 
+    y = value, 
+    fill = measure_of_response
+  )) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, size = 2, alpha = 0.6) + # Add jitter points
+  facet_wrap(~variable, scales = "free_y") +
+  theme_minimal() +
+  scale_fill_manual(values = c("#99FF99", "#66B3FF", "#FF9999")) + # Custom colors
+  stat_compare_means(
+    method = "wilcox.test", 
+    label = "p.signif", 
+    comparisons = list(
+      c("Complete Response", "Partial Response"),
+      c("Complete Response", "Clinical Progressive Disease")
+    )
+  ) +
+  ylim(c(0, 1)) +
+  ylab("Cell abundance")
+```
+
+# Response to treatment vs IGHV
+
+As a proxy of TME class 1 niche identified in the single cell analyses, we used IGHV genes to define a IGHV score. 
+
+```{r}
+# Subset RNA data to IGHV
+idx <- which(grepl("IGHV", colnames(gexp)))
+ighv <- as.data.frame(gexp[, idx])
+ighv$patient <- substr(rownames(ighv), 1, 12)
+
+# Merge with metadata
+data <- merge(
+  ighv, 
+  metadata, 
+  by.x = "patient", 
+  by.y = "bcr_patient_barcode"
+)
+```
+
+## Define a IGHV score
+
+```{r, fig.width=4, fig.height=5}
+data_median <- as.data.frame(
+  apply(
+    as.data.frame(gexp[, idx]), 
+    1, 
+    median, 
+    na.rm = TRUE
+  )
+)
+
+colnames(data_median) <- "median_ighv"
+data_median$patient <- substr(rownames(data_median), 1, 12)
+
+data_median <- merge(
+  data_median, 
+  metadata, 
+  by.x = "patient", 
+  by.y = "bcr_patient_barcode"
+)
+```
+
+## IGHV score vs treatment response
+
+We compare this IGHV score to treatment response.
+
+```{r}
+# Boxplot for all features
+ggplot(
+  data_median[data_median$measure_of_response != "", ], 
+  aes(
+    x = measure_of_response, 
+    y = median_ighv, 
+    fill = measure_of_response
+  )) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, size = 2, alpha = 0.6) + # Add jitter points
+  theme_minimal() +
+  scale_fill_manual(values = c("#99FF99", "#66B3FF", "#FF9999")) + # Custom colors
+  stat_compare_means(
+    method = "wilcox.test", 
+    label = "p.signif", 
+    comparisons = list(
+      c("Complete Response", "Partial Response"), 
+      c("Complete Response", "Clinical Progressive Disease")
+    )
+  ) +
+  ylab("IGHV score") +
+  xlab("") +
+  labs(title = "Response to adjuvant therapy") +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+
+## IGHV score recurrence-free survival 
+
+We define two groups of patients based on the IGHV score and looked for associations with outcome.
+
+```{r, fig.width=5, fig.height=5}
+# Merge IGHV score with fu data
+fu_data <- merge(
+  fu_data, 
+  data_median, 
+  by.x = "bcr_patient_barcode", 
+  by.y = "patient"
+)
+
+# Define a cutoff to stratify patients into high and low IGHV score
+cut <- surv_cutpoint(
+  as.data.frame(fu_data[fu_data$status != -1, ]),
+  time = "time", 
+  event = "status",
+  variables = c("median_ighv")
+)$cutpoint[, 1]
+
+
+fu_data$cut_ighv_median <- ifelse(fu_data$median_ighv > cut, "High", "Low")
+
+# Kaplan Meier
+fit <- survfit(Surv(time, status) ~ cut_ighv_median, data = fu_data)
+
+ggsurvplot(
+  fit,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  ylab = "Recurrence-free survival probability",
+  xlab = "Time (months)",
+  palette = c("#FF9999", "#99FF99"),
+  legend.title = "IGHV score",
+  legend.labs = c("High", "Low")
+)
+```
+
+## IGHV score per cell type
+
+IGHV score were correlated to cell abundance. 
+
+```{r}
+data_median_deconvoluted <- merge(
+  data_median, 
+  deconvoluted, 
+  by.y = "TCGA Participant Barcode", 
+  by.x = "patient"
+)
+
+data_median_deconvoluted$tertiles_ighv_median <- cut(
+  data_median_deconvoluted$median_ighv,
+  breaks = quantile(
+    data_median_deconvoluted$median_ighv, 
+    probs = seq(0, 1, by = 1 / 3), 
+    na.rm = TRUE
+  ),
+  include.lowest = TRUE,
+  labels = c("Low", "Medium", "High")
+)
+
+data_median_deconvoluted$two_groups <-ifelse(data_median_deconvoluted$median_ighv > cut, "High", "Low")
+```
+
+```{r, fig.height=20, fig.width=20}
+# Stack the data for plotting
+data_long <- data.table::melt(
+  data_median_deconvoluted, 
+  measure.vars = colnames(deconvoluted)[c(5:8, 37:64)]
+)
+
+data_long$tertiles_ighv_median <- factor(data_long$tertiles_ighv_median,
+  levels = c(
+    "Low",
+    "Medium",
+    "High"
+  )
+)
+
+data_long$two_groups <- factor(data_long$two_groups,
+  levels = c(
+    "Low",
+    "High"
+  )
+)
+```
+
+```{r, fig.width=30, fig.height=30}
+ggplot(data_long, aes(x = median_ighv, y = value)) +
+  geom_point(size = 2, alpha = 0.6) + # Scatterplot points
+  facet_wrap(~variable, scales = "free_y") +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) + # Linear regression line
+  theme_minimal() +
+  stat_cor(method = "pearson", label.x = 1.5, label.y.npc = "top") + # Pearson correlation
+  xlab("IGHV score") +
+  ylab("Cell Abundance")
+```
+
+```{r, eval=FALSE}
+ggplot(
+  data_long, 
+  aes(
+    x = tertiles_ighv_median,
+    y = value, 
+    fill = tertiles_ighv_median
+  )) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, size = 2, alpha = 0.6) + # Add jitter points
+  facet_wrap(~variable, scales = "free_y") +
+  theme_minimal() +
+  scale_fill_manual(values = c("#99FF99", "#66B3FF", "#FF9999")) + # Custom colors
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.signif", 
+    comparisons = list(
+      c("High", "Medium"), 
+      c("High", "Low"), 
+      c("Medium", "Low")
+    )
+  ) +
+  ylim(c(0, 1)) +
+  ylab("Cell abundance")
+```
+
+```{r, fig.height=20, fig.width=20}
+# Boxplot for all features
+ggplot(data_long, aes(x = two_groups, y = value, fill = two_groups)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, size = 2, alpha = 0.6) + # Add jitter points
+  facet_wrap(~variable, scales = "free_y") +
+  theme_minimal() +
+  scale_fill_manual(values = c("#99FF99", "#FF9999")) + # Custom colors
+  stat_compare_means(
+    method = "wilcox.test", 
+    label = "p.signif", 
+    comparisons = list(c("High", "Low"))
+  ) +
+  ylim(c(0, 1)) +
+  ylab("Cell abundance")
+```
+
+# Response to treatment vs TME classes
+
+This was a naive approach to define TME classes signature.
+
+## Define TME signatures
+
+```{r}
+significant_genes <- deseq_sc %>%
+  filter(padj < 005, abs(log2FoldChange) > 2 | abs(log2FoldChange) < -2) %>%
+  group_by(Comparison) %>%
+  summarise(Gene = list(Gene)) %>%
+  ungroup()
+
+significant_genes_tme1 <- c(significant_genes[1, 2][["Gene"]], significant_genes[4, 2][["Gene"]], significant_genes[5, 2][["Gene"]], significant_genes[6, 2][["Gene"]])
+
+common_genes_tme1 <- Reduce(intersect, significant_genes_tme1)
+
+significant_genes_tme2 <- c(significant_genes[2, 2][["Gene"]], significant_genes[4, 2][["Gene"]], significant_genes[6, 2][["Gene"]])
+
+common_genes_tme2 <- Reduce(intersect, significant_genes_tme2)
+
+significant_genes_tme0 <- c(significant_genes[1, 2][["Gene"]], significant_genes[2, 2][["Gene"]], significant_genes[3, 2][["Gene"]])
+
+common_genes_tme0 <- Reduce(intersect, significant_genes_tme0)
+
+significant_genes_tme3 <- c(significant_genes[3, 2][["Gene"]], significant_genes[5, 2][["Gene"]], significant_genes[6, 2][["Gene"]])
+
+common_genes_tme3 <- Reduce(intersect, significant_genes_tme3)
+```
+
+
+```{r}
+ssgsea <- function(X, gene_sets, alpha = 0.25, scale = T, norm = F, single = T) {
+  row_names <- rownames(X)
+  num_genes <- nrow(X)
+  gene_sets <- lapply(gene_sets, function(genes) {
+    which(row_names %in% genes)
+  })
+
+  # Ranks for genes
+  R <- matrixStats::colRanks(X, preserveShape = T, ties.method = "average")
+
+  # Calculate enrichment score (es) for each sample (column)
+  es <- apply(R, 2, function(R_col) {
+    gene_ranks <- order(R_col, decreasing = TRUE)
+
+    # Calc es for each gene set
+    es_sample <- sapply(gene_sets, function(gene_set_idx) {
+      # pos: match (within the gene set)
+      # neg: non-match (outside the gene set)
+      indicator_pos <- gene_ranks %in% gene_set_idx
+      indicator_neg <- !indicator_pos
+
+      rank_alpha <- (R_col[gene_ranks] * indicator_pos)^alpha
+
+      step_cdf_pos <- cumsum(rank_alpha) / sum(rank_alpha)
+      step_cdf_neg <- cumsum(indicator_neg) / sum(indicator_neg)
+
+      step_cdf_diff <- step_cdf_pos - step_cdf_neg
+
+      # Normalize by gene number
+      if (scale) step_cdf_diff <- step_cdf_diff / num_genes
+
+      # Use ssGSEA or not
+      if (single) {
+        sum(step_cdf_diff)
+      } else {
+        step_cdf_diff[which.max(abs(step_cdf_diff))]
+      }
+    })
+    unlist(es_sample)
+  })
+
+  if (length(gene_sets) == 1) es <- matrix(es, nrow = 1)
+
+  # Normalize by absolute diff between max and min
+  if (norm) es <- es / diff(range(es))
+
+  # Prepare output
+  rownames(es) <- names(gene_sets)
+  colnames(es) <- colnames(X)
+  return(es)
+}
+```
+
+
+```{r}
+log_tpm <- log2(gexp + 1)
+
+RES <- ssgsea(
+  X = t(log_tpm),
+  gene_sets = list(
+    TME1 = common_genes_tme1, 
+    TME0 = common_genes_tme0, 
+    TME2 = common_genes_tme2, 
+    TME3 = common_genes_tme3
+  ),
+  alpha = 0.25, scale = T, norm = F, single = T
+)
+```
+
+```{r}
+RES <- as.data.frame(t(RES))
+RES$patient <- substr(rownames(RES), 1, 12)
+
+RES <- merge(
+  RES, 
+  data_median
+)
+```
+
+```{r}
+# Stack data for plotting
+data_long <- data.table::melt(
+  RES, 
+  measure.vars = c("TME0", "TME1", "TME2", "TME3")
+)
+```
+
+
+## Correlate TME signatures and IGHV score
+
+We expect a higher correlation of IHGV score and TME1 compared to the other TME classes.
+
+```{r}
+ggplot(data_long, aes(x = median_ighv, y = value)) +
+  geom_point(size = 2, alpha = 0.6) + # Scatterplot points
+  facet_wrap(~variable, scales = "free_y") +
+  geom_smooth(method = "lm", color = "blue", se = FALSE) + # Linear regression line
+  theme_minimal() +
+  stat_cor(method = "pearson", label.x = 1.5, label.y.npc = "top") + # Pearson correlation
+  xlab("IGHV score") +
+  ylab("Signature Exposure")
+```
+
+## TME signatures vs treamtent response
+
+```{r}
+ggplot(
+  data_long[data_long$measure_of_response != "", ], 
+  aes(x = measure_of_response, y = value, fill = measure_of_response)) +
+  geom_boxplot() +
+  geom_jitter(width = 0.2, size = 2, alpha = 0.6) + # Add jitter points
+  facet_wrap(~variable, scales = "free_y") +
+  theme_minimal() +
+  scale_fill_manual(values = c("#99FF99", "#66B3FF", "#FF9999")) + # Custom colors
+  stat_compare_means(
+    method = "wilcox.test", 
+    label = "p.signif", 
+    comparisons = list(
+      c("Complete Response", "Partial Response"), 
+      c("Complete Response", "Clinical Progressive Disease")
+    )
+  ) +
+  ylab("Signature signal")
+```
+
